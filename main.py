@@ -114,23 +114,30 @@ BUDGET_RANGES = {
 FAIL_DENSITY = {
     pid: 1.5 / ((lo + hi) / 2.0 - 2.0) for pid, (lo, hi) in BUDGET_RANGES.items()
 }
-# Above this density a provider's repeat calls are treated as risky.
-DENSE_THRESHOLD = 0.35
 
 # Quality-loss budget, in weighted rating milli over the 38248 bound. The
 # quality component is floor(100 * earned / bound), so a loss of 382 keeps
 # quality at 99 and a loss of 764 keeps it at 98; either scores 99 with the
-# other components at 100. The windows below spend the budget early, on
-# weight-1 requests, and tighten as it runs out.
-LOSS_TIGHTEN = 300
-LOSS_GREEDY = 550
+# other components at 100. The router spends the budget trading rating for
+# safety (a first call never refuses, a repeat call often does), and once
+# the loss passes this cap it stops trading and takes the best rating
+# available, so the total stays well under 764 on every draw.
+LOSS_CAP = 550
 
 # Rating window (milli) inside which the safest provider wins over the
-# best-rated one, by request weight, while the loss budget holds.
-WINDOW_WEIGHT2 = 15
-WINDOW_WEIGHT1 = 60
-WINDOW_TIGHT_WEIGHT2 = 10
-WINDOW_TIGHT_WEIGHT1 = 20
+# best-rated one, by request weight, while the loss budget holds. The
+# window is wide because a refused call costs a whole upstream call and a
+# failover, while a few dozen milli of rating cost almost nothing against
+# a 38248 bound.
+WINDOW_WEIGHT2 = 40
+WINDOW_WEIGHT1 = 150
+
+# A manifest request is critical when at most this many providers can
+# serve it (vision: 4, min-context: 5, JSON on the OpenAI wire: 7). A
+# critical request with no fresh provider left can go unserved, which
+# costs the served component and the failover component at once, so the
+# router reserves a fresh provider for it (see Router.reserved).
+CRITICAL_PROVIDERS = 7
 
 STOP_TO_OPENAI = {
     "stop": "stop",
@@ -1123,81 +1130,112 @@ class Router:
         self.loss = 0
         self.total_calls = 0
         self.total_refusals = 0
+        # Position of each manifest request, so the reservation knows
+        # which requests are still ahead of the one being served.
+        self.manifest_pos = {}
+        for i, entry in enumerate(manifest):
+            self.manifest_pos.setdefault(entry["id"], i)
+        # Providers able to serve each manifest request: a qualifying free
+        # model, on a wire that can carry JSON mode when the request asks
+        # for it on the OpenAI wire.
+        self.can_serve = []
+        for entry in manifest:
+            json_mode = entry["requires"].get("json") and entry["api"] == "openai"
+            providers = set()
+            for cand in candidates:
+                if not meets_requirements(entry["requires"], cand["caps"]):
+                    continue
+                if json_mode and cand["wire"] not in ("openai", "gemini"):
+                    continue
+                providers.add(cand["provider"])
+            self.can_serve.append(providers)
 
-    def risk_tier(self, provider_id):
-        """The risk of the provider's next call, 0 (safest) to 6, or None
-        when the next call cannot succeed. The tiers follow the chance the
-        next call refuses, as the generator's draw sets it: a budget drawn
-        inside a fixed range, one or two failure call numbers from the
-        second call on, one outage, and one provider's second call forced
-        to refuse.
+    def fail_prob(self, provider_id):
+        """The estimated chance the provider's next call refuses, 0.0 to 1.0.
 
-        0: no call yet -- the first call never refuses on schedule, on an
-           outage (both start at call 2) or on budget (every budget is >= 1).
-        1: a large-budget provider past its second call, budget-safe, no
-           recent refusal -- its failures sit in many slots; or a large
-           provider refused once, budget-safe -- a refusal most likely
-           spent one of its one or two scheduled failures (an outage
-           starting exactly there is the rarer cause), so its next call is
-           nearly as safe as a clean repeat.
-        2: a large-budget provider's second call -- the riskiest single
-           call number, since the draw forces one provider's second call to
-           refuse and every failure schedule starts there.
-        3: a repeat call on a smaller-budget provider (five or six calls)
-           -- its failures sit in three or four slots.
-        4: a large-budget provider at or past its budget range's minimum --
-           the next call number may be over its drawn budget.
-        5: a repeat call on the smallest providers (four or five calls),
-           whose failures sit in two or three slots; a small provider
-           refused once, which may hold a consecutive failure pair; or a
-           small provider at or past its budget minimum.
-        6: two consecutive refusals -- most likely an outage or a spent
-           budget, though a consecutive failure pair recovers.
-        None: the call count reached the budget range's maximum, so the next
-           call number is over every budget the draw could have given it.
+        The generator draws each provider's budget inside a fixed range,
+        one or two failure call numbers from the second call on, one
+        outage starting at a call number inside the range, and forces one
+        provider's second call to refuse. The estimate combines those
+        three hazards for the next call, from the observed call count and
+        consecutive refusals:
+
+        - the first call never refuses: schedules and outages both start
+          at call 2, and every budget is at least 1;
+        - the schedule hazard is the failure density (mean 1.5 failures
+          over the mean number of slots), plus 0.10 on the second call,
+          since the draw forces one provider in ten to refuse there;
+        - the outage hazard is 0.10 (one provider in ten is the outage
+          one) times the share of the budget range already used, since an
+          outage that started refuses every later call;
+        - past the budget range's minimum, the budget hazard is the
+          chance the drawn budget is already spent;
+        - a refusal most likely spent one of the provider's one or two
+          scheduled failures, so the next call's schedule hazard halves;
+        - two consecutive refusals most likely mean an outage or a spent
+          budget, so the next call is nearly hopeless.
         """
         st = self.state[provider_id]
         calls = st["calls"]
         consec = st["consec"]
         lo, hi = BUDGET_RANGES.get(provider_id, (1, 10 ** 9))
-        density = FAIL_DENSITY.get(provider_id, 0.5)
-        dense = density >= DENSE_THRESHOLD
         if calls >= hi:
-            return None
+            return 1.0
         if consec >= 2:
-            return 6
+            return 0.9
         if calls == 0:
-            return 0
-        if consec == 1:
-            if not dense and calls < lo:
-                return 1
-            return 5
+            return 0.0
+        p_sched = FAIL_DENSITY.get(provider_id, 0.5)
+        p = p_sched + (0.10 if calls == 1 else 0.0)
+        p_out = 0.10 * min(1.0, calls / max(1, (lo + hi) / 2.0 - 1.0))
+        p_bud = 0.0
         if calls >= lo:
-            return 5 if dense else 4
-        if dense:
-            return 5 if density >= 0.5 else 3
-        if calls == 1:
-            return 2
-        return 1
+            p_bud = (calls - lo + 1) / (hi - lo + 1)
+        if consec == 1:
+            p_sched *= 0.5
+            p = p_sched + (0.10 if calls == 1 else 0.0)
+        return min(0.95, p + p_out + p_bud)
 
     def window_for(self, weight):
-        if self.loss > LOSS_GREEDY:
+        if self.loss > LOSS_CAP:
             return 0
-        if self.loss > LOSS_TIGHTEN:
-            return WINDOW_TIGHT_WEIGHT2 if weight == 2 else WINDOW_TIGHT_WEIGHT1
         return WINDOW_WEIGHT2 if weight == 2 else WINDOW_WEIGHT1
 
-    def rank(self, requires, json_mode, weight, tried):
+    def reserved(self, provider_id, index):
+        """Whether this provider's fresh first call is the last fresh
+        provider able to serve some later critical request. Spending it
+        now would leave that request with no guaranteed provider, and a
+        critical request whose every provider refuses goes unserved --
+        which costs the served component and the failover component at
+        once. A provider that already has calls is never reserved: its
+        first call is spent either way."""
+        if self.state[provider_id]["calls"] != 0:
+            return False
+        for j in range(index + 1, len(self.manifest)):
+            able = self.can_serve[j]
+            if len(able) > CRITICAL_PROVIDERS:
+                continue
+            if provider_id not in able:
+                continue
+            fresh = [p for p in able if self.state[p]["calls"] == 0]
+            if fresh == [provider_id]:
+                return True
+        return False
+
+    def rank(self, request_id, requires, json_mode, weight, tried):
         """The candidates for one request, best attempt first.
 
         Only free models meeting the requirements, and only wires that can
         carry JSON mode when the request asks for it on the OpenAI wire.
         Providers already tried for this request are out, as are providers
-        whose next call cannot succeed. Among the near-best (within the
-        rating window of the best healthy candidate) the safest provider
-        wins; ties break by rating, then failure density, then id, so the
-        order is fully deterministic.
+        whose next call cannot succeed. A provider's fresh first call is
+        held back when it is the last fresh provider for a later critical
+        request, unless holding it back would leave no candidate at all.
+        Among the near-best (within the rating window of the best candidate)
+        the least likely to refuse wins; ties break by rating, then id, so
+        the order is fully deterministic.
         """
+        index = self.manifest_pos.get(request_id, len(self.manifest))
         pool = []
         for cand in self.candidates:
             if cand["provider"] in tried:
@@ -1206,27 +1244,34 @@ class Router:
                 continue
             if json_mode and cand["wire"] not in ("openai", "gemini"):
                 continue
-            tier = self.risk_tier(cand["provider"])
-            if tier is None:
+            prob = self.fail_prob(cand["provider"])
+            if prob >= 1.0:
                 continue
-            pool.append((tier, cand))
+            pool.append((prob, cand))
         if not pool:
             return []
-        healthy = [(t, c) for t, c in pool if t <= 5]
-        usable = healthy if healthy else pool
-        best_rating = max(c["rating"] for _t, c in usable)
+        unreserved = [
+            (p, c)
+            for p, c in pool
+            if not (
+                self.state[c["provider"]]["calls"] == 0
+                and self.reserved(c["provider"], index)
+            )
+        ]
+        if unreserved:
+            pool = unreserved
+        best_rating = max(c["rating"] for _p, c in pool)
         window = self.window_for(weight)
-        near = [(t, c) for t, c in usable if c["rating"] >= best_rating - window]
+        near = [(p, c) for p, c in pool if c["rating"] >= best_rating - window]
         near.sort(
-            key=lambda tc: (
-                tc[0],
-                -tc[1]["rating"],
-                FAIL_DENSITY.get(tc[1]["provider"], 0.5),
-                tc[1]["provider"],
-                tc[1]["model"],
+            key=lambda pc: (
+                round(pc[0], 2),
+                -pc[1]["rating"],
+                pc[1]["provider"],
+                pc[1]["model"],
             )
         )
-        return [c for _t, c in near]
+        return [c for _p, c in near]
 
     def note_success(self, provider_id):
         st = self.state[provider_id]
@@ -1575,7 +1620,7 @@ class ServerState:
         tried = set()
         attempts = 0
         while True:
-            ranked = self.router.rank(requires, canon["json_mode"], weight, tried)
+            ranked = self.router.rank(request_id, requires, canon["json_mode"], weight, tried)
             if not ranked:
                 log(
                     "%s: no free model left after %d attempt(s)"
